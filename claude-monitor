@@ -1,0 +1,884 @@
+#!/usr/bin/env python3
+"""Claude Code session monitor TUI"""
+
+import curses
+import glob
+import json
+import os
+import re
+import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+
+SESSIONS_DIR  = Path.home() / ".claude" / "sessions"
+EVENTS_LOG    = Path.home() / ".claude" / "monitor-events.jsonl"
+LABELS_FILE   = Path.home() / ".claude" / "monitor-labels.json"
+REGISTRY_FILE = Path.home() / ".claude" / "monitor-registry.json"
+REFRESH_INTERVAL  = 1.0
+REGISTRY_MAX_DAYS = 7  # prune ended sessions older than this
+
+# color palette — index 0 means "use status color" (default)
+PALETTE = [None, "red", "green", "cyan", "magenta", "blue", "yellow"]
+PALETTE_LABELS = ["auto", "red", "green", "cyan", "magenta", "blue", "yellow"]
+
+# ── labels persistence ────────────────────────────────────────────────────────
+
+def load_labels():
+    try:
+        return json.loads(LABELS_FILE.read_text())
+    except Exception:
+        return {}
+
+def save_labels(labels):
+    try:
+        LABELS_FILE.write_text(json.dumps(labels, indent=2))
+    except Exception:
+        pass
+
+# ── session registry ─────────────────────────────────────────────────────────
+
+def load_registry():
+    try:
+        return json.loads(REGISTRY_FILE.read_text())
+    except Exception:
+        return {}
+
+def save_registry(reg):
+    try:
+        REGISTRY_FILE.write_text(json.dumps(reg, indent=2))
+    except Exception:
+        pass
+
+def update_registry(reg, live_sessions):
+    """Merge live sessions into registry; mark ended ones. Returns (reg, dirty)."""
+    now_ts = int(time.time())
+    cutoff = now_ts - REGISTRY_MAX_DAYS * 86400
+    live_sids = {s.get("sessionId") for s in live_sessions.values()}
+    dirty = False
+
+    for sess in live_sessions.values():
+        sid = sess.get("sessionId", "")
+        if not sid:
+            continue
+        new_vals = {
+            "sid":        sid,
+            "pid":        sess.get("pid"),
+            "cwd":        sess.get("cwd", ""),
+            "started_at": sess.get("startedAt", 0),
+            "version":    sess.get("version", ""),
+            "status":     sess.get("status", "?"),
+        }
+        entry = reg.get(sid, {})
+        if any(entry.get(k) != v for k, v in new_vals.items()) or "ended_at" in entry:
+            reg.setdefault(sid, {}).update(new_vals)
+            reg[sid].pop("ended_at", None)
+            dirty = True
+
+    for sid, entry in reg.items():
+        if sid not in live_sids and "ended_at" not in entry:
+            entry["ended_at"] = now_ts
+            entry["status"]   = "ended"
+            dirty = True
+
+    to_prune = [sid for sid, e in reg.items()
+                if e.get("ended_at", now_ts) < cutoff]
+    for sid in to_prune:
+        del reg[sid]
+        dirty = True
+
+    return reg, dirty
+
+def pane_strip(pane_id):
+    """Remove leading % from tmux pane IDs, e.g. '%5' → '5'."""
+    return pane_id.lstrip("%") if pane_id else ""
+
+def hook_pane_map():
+    """
+    Return {session_id: pane_number} sourced from session-start hook events.
+    These are 100% accurate — $TMUX_PANE is set by tmux and inherited by Claude.
+    """
+    if not EVENTS_LOG.exists():
+        return {}
+    result = {}
+    try:
+        with open(EVENTS_LOG, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 65536))  # last 64KB is enough
+            tail = f.read().decode("utf-8", errors="replace")
+        for line in tail.splitlines():
+            try:
+                ev = json.loads(line)
+                if ev.get("event") == "session-start":
+                    sid   = ev.get("session_id", "")
+                    pane  = ev.get("tmux_pane", "")
+                    if sid and pane:
+                        result[sid] = pane  # keep raw %N for tmux commands
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return result
+
+# ── data loaders ─────────────────────────────────────────────────────────────
+
+def load_sessions():
+    sessions = {}
+    for path in sorted(glob.glob(str(SESSIONS_DIR / "*.json"))):
+        try:
+            data = json.loads(Path(path).read_text())
+            pid = str(data.get("pid", Path(path).stem))
+            sessions[pid] = data
+        except Exception:
+            pass
+    return sessions
+
+def cwd_to_project_slug(cwd):
+    """Convert an absolute path to Claude Code's project directory name."""
+    return cwd.replace("/", "-").replace(".", "-")
+
+def session_model(sid, cwd):
+    """Read the model from the last assistant message in the session JSONL."""
+    try:
+        slug = cwd_to_project_slug(cwd)
+        path = SESSIONS_DIR.parent / "projects" / slug / f"{sid}.jsonl"
+        if not path.exists():
+            return ""
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 8192))
+            tail = f.read().decode("utf-8", errors="replace")
+        for line in reversed(tail.splitlines()):
+            try:
+                d = json.loads(line)
+                model = d.get("message", {}).get("model", "")
+                if model:
+                    return model  # caller applies fmt_model
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ""
+
+def fmt_model(model):
+    """claude-sonnet-4-6 → sonnet 4.6  |  claude-haiku-4-5-20251001 → haiku 4.5"""
+    m = model.removeprefix("claude-")
+    m = re.sub(r"-(\d+)-(\d+)(-\d+)*$", r" \1.\2", m)
+    return m
+
+def load_recent_events(n=40):
+    if not EVENTS_LOG.exists():
+        return []
+    try:
+        # each event averages ~400 bytes; read enough to cover n events with headroom
+        window = max(16384, n * 512)
+        with open(EVENTS_LOG, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - window))
+            tail = f.read().decode("utf-8", errors="replace")
+        events = []
+        for line in reversed([l for l in tail.splitlines() if l.strip()]):
+            try:
+                events.append(json.loads(line))
+            except Exception:
+                pass
+            if len(events) >= n:
+                break
+        return list(reversed(events))
+    except Exception:
+        return []
+
+def per_session_state(events):
+    state = {}
+    seen_tool = set()
+    seen_notif = set()
+    for ev in reversed(events):
+        sid  = ev.get("session_id", "")
+        kind = ev.get("event", "")
+        payload = ev.get("payload", {})
+        if not sid:
+            continue
+        if kind == "pre-tool-use" and sid not in seen_tool:
+            tool = payload.get("tool_name", "")
+            summary = (payload.get("tool_input", {}).get("description", "")
+                       or str(payload.get("tool_input", {}).get("command", ""))[:60])
+            state.setdefault(sid, {})["tool"] = (tool, summary)
+            seen_tool.add(sid)
+        if kind == "notification" and sid not in seen_notif:
+            msg = payload.get("message", payload.get("title", ""))
+            state.setdefault(sid, {})["notification"] = msg
+            seen_notif.add(sid)
+    return state
+
+# ── formatting ────────────────────────────────────────────────────────────────
+
+def fmt_uptime(started_ms):
+    try:
+        secs = int((datetime.now(tz=timezone.utc) -
+                    datetime.fromtimestamp(started_ms / 1000, tz=timezone.utc)).total_seconds())
+        h, rem = divmod(secs, 3600)
+        m, s   = divmod(rem, 60)
+        return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
+    except Exception:
+        return "?"
+
+def short_cwd(cwd):
+    home = str(Path.home())
+    return ("~" + cwd[len(home):]) if cwd.startswith(home) else cwd
+
+def project_name(cwd):
+    parts = [p for p in cwd.rstrip("/").split("/") if p and p != "~"]
+    return parts[-1] if parts else cwd
+
+def clamp(s, n):
+    return str(s)[:n].ljust(n)
+
+# ── tmux helpers ─────────────────────────────────────────────────────────────
+
+GENERIC_SHELL_NAMES = {"bash", "zsh", "fish", "sh", "dash", "tcsh", "ksh"}
+
+def tmux_window_name(pane_id):
+    """Return the tmux window name for a given pane_id, or '' if unavailable/generic."""
+    try:
+        name = subprocess.run(
+            ["tmux", "display-message", "-t", pane_id, "-p", "#{window_name}"],
+            capture_output=True, text=True, timeout=1,
+        ).stdout.strip()
+        return "" if name.lower() in GENERIC_SHELL_NAMES else name
+    except Exception:
+        return ""
+
+def _run(cmd, timeout=2):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+
+def tmux_pane_map():
+    """
+    Return ({pid: pane_id}, {pane_id: window_index}).
+    Runs tmux list-panes and ps in parallel — both are independent.
+    """
+    try:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_panes = ex.submit(_run, ["tmux", "list-panes", "-a", "-F",
+                                       "#{pane_id} #{pane_pid} #{window_index}"])
+            f_procs = ex.submit(_run, ["ps", "-eo", "pid=,ppid="])
+            pane_out = f_panes.result()
+            proc_out = f_procs.result()
+
+        pane_shells  = {}
+        pane_win_idx = {}
+        for line in pane_out.splitlines():
+            parts = line.strip().split()
+            if len(parts) == 3:
+                try:
+                    pane_shells[int(parts[1])] = parts[0]
+                    pane_win_idx[parts[0]]      = parts[2]
+                except ValueError:
+                    pass
+
+        if not pane_shells:
+            return {}, {}
+
+        children = {}  # {ppid: [child_pids]}
+        for line in proc_out.splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                try:
+                    pid, ppid = int(parts[0]), int(parts[1])
+                    children.setdefault(ppid, []).append(pid)
+                except ValueError:
+                    pass
+
+        # step 3: BFS from each shell PID — map every descendant to its pane
+        result = {}
+        for shell_pid, pane_id in pane_shells.items():
+            queue = [shell_pid]
+            while queue:
+                current = queue.pop()
+                result[current] = pane_id
+                queue.extend(children.get(current, []))
+
+        return result, pane_win_idx
+    except Exception:
+        return {}, {}
+
+def pane_for_pid(pid, pane_map):
+    """O(1) lookup — pane_map now covers all descendant PIDs directly."""
+    try:
+        return pane_map.get(int(pid))
+    except Exception:
+        return None
+
+def window_index_for_pane(pane_id, pane_win_idx):
+    """Return the tmux window index (status-bar number) for a raw pane_id."""
+    return pane_win_idx.get(pane_id, "")
+
+def pane_from_proc_env(pid):
+    """Read $TMUX_PANE directly from the running process environment (macOS: ps eww)."""
+    try:
+        out = subprocess.run(
+            ["ps", "eww", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+        for token in out.split():
+            if token.startswith("TMUX_PANE="):
+                return token.split("=", 1)[1]
+    except Exception:
+        pass
+    return None
+
+def resolve_pane(sid, pid, hook_panes, pane_map):
+    """Return raw pane_id (%N) for tmux commands. Priority: hook → proc env → BFS."""
+    return (hook_panes.get(sid)
+            or (pane_from_proc_env(pid) if pid else None)
+            or pane_for_pid(pid, pane_map))
+
+def resolve_pane_display(sid, pid, hook_panes, pane_map, pane_win_idx):
+    """Return window index string for display (what the user sees in the status bar)."""
+    pane_id = resolve_pane(sid, pid, hook_panes, pane_map)
+    if not pane_id:
+        return ""
+    return window_index_for_pane(pane_id, pane_win_idx) or pane_strip(pane_id)
+
+# ── curses color setup ────────────────────────────────────────────────────────
+
+# pair indices
+P_HEADER   = 1
+P_BUSY     = 2
+P_IDLE     = 3
+P_NORMAL   = 4
+P_TOOL     = 5
+P_DIM      = 6
+P_WAITING  = 7
+P_SEL      = 8   # selected row highlight
+# pairs 10–16: session label colors (bold)
+PALETTE_PAIRS = {
+    "red":     10,
+    "green":   11,
+    "cyan":    12,
+    "magenta": 13,
+    "blue":    14,
+    "yellow":  15,
+}
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(P_HEADER,  curses.COLOR_CYAN,    -1)
+    curses.init_pair(P_BUSY,    curses.COLOR_GREEN,   -1)
+    curses.init_pair(P_IDLE,    curses.COLOR_YELLOW,  -1)
+    curses.init_pair(P_NORMAL,  curses.COLOR_WHITE,   -1)
+    curses.init_pair(P_TOOL,    curses.COLOR_MAGENTA, -1)
+    curses.init_pair(P_DIM,     8,                    -1)
+    curses.init_pair(P_WAITING, curses.COLOR_BLUE,    -1)
+    curses.init_pair(P_SEL,     curses.COLOR_BLACK,   curses.COLOR_WHITE)
+    curses.init_pair(PALETTE_PAIRS["red"],     curses.COLOR_RED,     -1)
+    curses.init_pair(PALETTE_PAIRS["green"],   curses.COLOR_GREEN,   -1)
+    curses.init_pair(PALETTE_PAIRS["cyan"],    curses.COLOR_CYAN,    -1)
+    curses.init_pair(PALETTE_PAIRS["magenta"], curses.COLOR_MAGENTA, -1)
+    curses.init_pair(PALETTE_PAIRS["blue"],    curses.COLOR_BLUE,    -1)
+    curses.init_pair(PALETTE_PAIRS["yellow"],  curses.COLOR_YELLOW,  -1)
+
+def color_pair_for(color_name, fallback_pair):
+    if color_name and color_name in PALETTE_PAIRS:
+        return curses.color_pair(PALETTE_PAIRS[color_name]) | curses.A_BOLD
+    return curses.color_pair(fallback_pair)
+
+# ── input prompt ─────────────────────────────────────────────────────────────
+
+def prompt_input(stdscr, h, w, prompt):
+    """Draw a bottom input bar; return typed string or None if cancelled (Esc)."""
+    curses.curs_set(1)
+    stdscr.nodelay(False)
+    bar = f" {prompt}: "
+    buf = []
+    try:
+        while True:
+            # redraw bar with current buffer
+            line = (bar + "".join(buf))[:w - 1]
+            stdscr.addstr(h - 1, 0, line.ljust(w - 1), curses.color_pair(P_SEL))
+            stdscr.move(h - 1, min(len(line), w - 2))
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch == 27:          # Esc — cancel
+                return None
+            elif ch in (10, 13):  # Enter — confirm
+                return "".join(buf).strip()
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                if buf:
+                    buf.pop()
+            elif 32 <= ch <= 126:
+                if len(buf) < 50:
+                    buf.append(chr(ch))
+    except Exception:
+        return None
+    finally:
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+
+# ── main draw loop ────────────────────────────────────────────────────────────
+
+def draw(stdscr):
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    init_colors()
+
+    selected        = 0
+    last_render     = 0.0
+    labels          = load_labels()
+    registry        = load_registry()
+    cmd_buf         = ""
+    pane_map, pane_win_idx = tmux_pane_map()
+    pane_map_ts     = time.monotonic()
+    hook_panes      = {}
+    hook_panes_ts   = 0.0          # force immediate load on first render
+    flash_msg       = ""
+    flash_until     = 0.0
+    model_cache     = {}           # {sid: (model_str, ts)} — ts allows retry on ""
+    proc_pane_cache = {}           # {pid: raw_pane_id} — permanent for session lifetime
+    win_name_cache  = {}           # {raw_pane_id: (name, ts)}
+
+    # mutable state updated by render block, read by key handlers
+    all_entries     = []
+    live_entries    = []
+    n_sessions      = 0
+    session_panes   = {}           # {sid: raw_pane_id} — computed once per render
+
+    while True:
+        # ── fast path: input only ─────────────────────────────────────────
+        key = stdscr.getch()
+
+        # ── throttle ─────────────────────────────────────────────────────
+        now = time.monotonic()
+        if now - last_render < REFRESH_INTERVAL and key == -1:
+            time.sleep(0.05)
+            continue
+        last_render = now
+
+        # ── data refresh (once per second) ───────────────────────────────
+        sessions = load_sessions()
+        registry, reg_dirty = update_registry(registry, sessions)
+        if reg_dirty:
+            save_registry(registry)
+
+        if now - hook_panes_ts > 30:          # hook panes rarely change
+            hook_panes    = hook_pane_map()
+            hook_panes_ts = now
+
+        if now - pane_map_ts > 5:             # already had 5s refresh
+            pane_map, pane_win_idx = tmux_pane_map()
+            pane_map_ts = now
+
+        # build unified list
+        live_entries  = [(sid, e) for sid, e in registry.items() if "ended_at" not in e]
+        ended_entries = [(sid, e) for sid, e in registry.items() if "ended_at" in e]
+        live_entries.sort(key=lambda x: x[1].get("pid", 0))
+        ended_entries.sort(key=lambda x: x[1].get("ended_at", 0), reverse=True)
+        all_entries  = live_entries + ended_entries
+        n_sessions   = len(all_entries)
+        selected     = max(0, min(selected, n_sessions - 1))
+
+        # identify sessions needing first-time fetches (pane + model both uncached)
+        needs_fetch = [
+            (sid, entry) for sid, entry in live_entries
+            if entry.get("pid") not in proc_pane_cache
+            or (model_cache.get(sid) is None
+                or (not model_cache[sid][0] and now - model_cache[sid][1] > 10))
+        ]
+
+        if needs_fetch:
+            def fetch_session(sid_entry):
+                sid, entry = sid_entry
+                pid_val = entry.get("pid")
+                pane = (hook_panes.get(sid)
+                        or (pane_from_proc_env(pid_val) if pid_val else None)
+                        or pane_for_pid(pid_val, pane_map))
+                model = session_model(sid, entry.get("cwd", ""))
+                return sid, pid_val, pane, model
+
+            with ThreadPoolExecutor(max_workers=min(len(needs_fetch), 6)) as ex:
+                for sid, pid_val, pane, model in ex.map(fetch_session, needs_fetch):
+                    if pid_val:
+                        proc_pane_cache[pid_val] = pane
+                    model_cache[sid] = (fmt_model(model) if model else "", now)
+
+        # build session_panes from cache
+        session_panes = {}
+        for sid, entry in live_entries:
+            pid_val = entry.get("pid")
+            raw = proc_pane_cache.get(pid_val) if pid_val else None
+            if raw:
+                session_panes[sid] = raw
+
+        # evict stale pid entries (process died)
+        live_pids = {e.get("pid") for _, e in live_entries}
+        for pid in list(proc_pane_cache):
+            if pid not in live_pids:
+                del proc_pane_cache[pid]
+
+        # sync session names from tmux window names (cached 5s)
+        labels_dirty = False
+        for sid, entry in live_entries:
+            raw = session_panes.get(sid)
+            if not raw:
+                continue
+            cached_win = win_name_cache.get(raw)
+            if cached_win and now - cached_win[1] < 5:
+                win_name = cached_win[0]
+            else:
+                win_name = tmux_window_name(raw)
+                win_name_cache[raw] = (win_name, now)
+            if win_name and win_name != labels.get(sid, {}).get("name"):
+                labels.setdefault(sid, {})["name"] = win_name
+                labels_dirty = True
+        if labels_dirty:
+            save_labels(labels)
+
+        # ── command sequences (:q  dd) ────────────────────────────────────
+        if key == ord(":"):
+            cmd_buf = ":"
+        elif key == ord("d") and not cmd_buf:
+            cmd_buf = "d"
+        elif cmd_buf:
+            if cmd_buf == ":":
+                if key == ord("q"):
+                    cmd_buf = ":q"
+                elif key != -1:
+                    cmd_buf = ""
+            elif cmd_buf == ":q":
+                if key in (10, 13):   # Enter confirms quit
+                    break
+                elif key != -1:
+                    cmd_buf = ""
+            elif cmd_buf == "d":
+                if key == ord("d") and n_sessions > 0:  # dd confirmed
+                    sid, _ = all_entries[selected]
+                    registry.pop(sid, None)
+                    labels.pop(sid, None)
+                    save_registry(registry)
+                    save_labels(labels)
+                    selected = max(0, min(selected, len(all_entries) - 2))
+                    flash_msg   = f"deleted: {sid[:8]}…"
+                    flash_until = time.monotonic() + 2.0
+                    cmd_buf = ""
+                elif key != -1:  # any other real key cancels
+                    cmd_buf = ""
+
+        if n_sessions > 0:
+            if key in (curses.KEY_UP, ord("k")):
+                selected = max(0, selected - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                selected = min(n_sessions - 1, selected + 1)
+
+            elif key == ord("n"):
+                h, w = stdscr.getmaxyx()
+                sid, _ = all_entries[selected]
+                current_name = labels.get(sid, {}).get("name", "")
+                name = prompt_input(stdscr, h, w, f"Name [{current_name or 'new name'}]")
+                if name is None:
+                    pass  # cancelled
+                elif name:
+                    labels.setdefault(sid, {})["name"] = name
+                    save_labels(labels)
+                    # push name to tmux window so both stay in sync
+                    if True:
+                        pane_id = session_panes.get(sid)
+                        if pane_id:
+                            try:
+                                subprocess.run(
+                                    ["tmux", "rename-window", "-t", pane_id, name],
+                                    timeout=2,
+                                )
+                            except Exception:
+                                pass
+                else:
+                    if sid in labels:
+                        labels[sid].pop("name", None)
+                        labels[sid].pop("auto", None)
+                        if not labels[sid]:
+                            labels.pop(sid)
+                    save_labels(labels)
+
+            elif key == ord("c"):
+                sid, _ = all_entries[selected]
+                current_color = labels.get(sid, {}).get("color")
+                idx = PALETTE.index(current_color) if current_color in PALETTE else 0
+                next_color = PALETTE[(idx + 1) % len(PALETTE)]
+                if next_color is None:
+                    if sid in labels:
+                        labels[sid].pop("color", None)
+                        if not labels[sid]:
+                            labels.pop(sid)
+                else:
+                    labels.setdefault(sid, {})["color"] = next_color
+                save_labels(labels)
+
+            elif key == ord("x"):
+                sid, _ = all_entries[selected]
+                labels.pop(sid, None)
+                save_labels(labels)
+
+            elif key == ord("y"):
+                sid, _ = all_entries[selected]
+                if sid:
+                    try:
+                        subprocess.run(["pbcopy"], input=sid.encode(), timeout=2)
+                        flash_msg   = f"copied: {sid}"
+                    except Exception as e:
+                        flash_msg   = f"copy failed: {e}"
+                    flash_until = time.monotonic() + 2.0
+
+            elif key in (ord("r"), curses.KEY_ENTER, 10, 13):
+                sid, entry = all_entries[selected]
+                if not os.environ.get("TMUX"):
+                    flash_msg   = "not inside tmux — r only works in a tmux session"
+                    flash_until = time.monotonic() + 3.0
+                elif not sid:
+                    flash_msg   = "no session id"
+                    flash_until = time.monotonic() + 2.0
+                else:
+                    pane_id  = session_panes.get(sid)
+                    win_name = (labels.get(sid, {}).get("name")
+                                or project_name(short_cwd(entry.get("cwd", "")))
+                                or sid[:8])
+                    try:
+                        if pane_id:
+                            # session is alive in a known pane — just go there
+                            subprocess.run(["tmux", "switch-client", "-t", pane_id], timeout=5)
+                            disp = window_index_for_pane(pane_id, pane_win_idx) or pane_strip(pane_id)
+                            flash_msg = f"switched to window {disp} ({win_name})"
+                        else:
+                            # no pane — open a new window and resume
+                            subprocess.run(
+                                ["tmux", "new-window", "-n", win_name,
+                                 f"claude --resume {sid}"],
+                                timeout=5,
+                            )
+                            if "ended_at" in entry:
+                                registry.pop(sid, None)
+                                save_registry(registry)
+                            flash_msg = f"opened window '{win_name}' → claude --resume {sid[:8]}…"
+                    except Exception as e:
+                        flash_msg = f"tmux error: {e}"
+                    flash_until = time.monotonic() + 3.0
+
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+
+        # ── header ────────────────────────────────────────────────────────
+        ts_str = datetime.now().strftime("%H:%M:%S")
+        if cmd_buf:
+            hint = cmd_buf
+        elif flash_msg and time.monotonic() < flash_until:
+            hint = f"✓ {flash_msg}"
+        else:
+            flash_msg = ""
+            hint = "↑↓/jk select  n name  c color  x clear  y copy-id  r resume  dd delete  :q quit"
+        header = f" CLAUDE MONITOR  {ts_str}  {hint}"
+        try:
+            stdscr.addstr(0, 0, header[:w].ljust(w), curses.color_pair(P_HEADER) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        # refresh tmux pane map every 5 s
+        if time.monotonic() - pane_map_ts > 5:
+            pane_map, pane_win_idx = tmux_pane_map()
+            pane_map_ts            = time.monotonic()
+
+        # load enough events to fill the whole screen; the render loop below
+        # slices to exactly (h - row - 1) lines so it's naturally dynamic:
+        # more sessions → higher row → fewer event lines shown, and vice-versa.
+        events     = load_recent_events(h)
+        sess_state = per_session_state(events)
+
+        row = 2
+
+        C_MODEL  = 12
+        C_PID    = 6
+        C_STATUS = 8
+        C_SID    = 8   # first 8 chars of session UUID
+        C_PANE   = 4   # tmux pane id e.g. %12
+        C_NAME   = 32
+        C_PRJ    = 16
+        C_UP     = 8
+        C_TOOL   = 12
+
+        # column headers
+        x = 1
+        for label, width in [("PID", C_PID), ("STATUS", C_STATUS),
+                              ("SESSION", C_SID), ("PANE", C_PANE),
+                              ("NAME", C_NAME), ("PROJECT", C_PRJ),
+                              ("UPTIME", C_UP), ("TOOL", C_TOOL),
+                              ("MODEL", C_MODEL), ("DETAIL", 0)]:
+            avail = width if width else max(0, w - x - 1)
+            try:
+                stdscr.addstr(row, x, label[:avail].ljust(avail),
+                              curses.A_BOLD | curses.A_UNDERLINE)
+            except curses.error:
+                pass
+            x += avail + 1
+        row += 1
+
+        # session rows
+        for i, (sid, entry) in enumerate(all_entries):
+            if row >= h - 6:
+                break
+
+            is_ended = "ended_at" in entry
+            pid_str  = str(entry.get("pid", "?"))
+            status   = entry.get("status", "?")
+            cwd      = short_cwd(entry.get("cwd", "?"))
+            uptime   = fmt_uptime(entry.get("started_at", entry.get("startedAt", 0)))
+            sstate   = sess_state.get(sid, {})
+            tool_name, tool_summary = sstate.get("tool", ("", ""))
+            notif_msg  = sstate.get("notification", "")
+            label_data = labels.get(sid, {})
+            label_name  = label_data.get("name", "")
+            label_color = label_data.get("color")
+
+            prj = project_name(cwd)
+
+            # status label
+            if is_ended:
+                status_label = "ended"
+                status_pair  = curses.color_pair(P_DIM)
+            elif status == "busy":
+                status_label = "busy"
+                status_pair  = curses.color_pair(P_BUSY)
+            elif notif_msg:
+                status_label = "waiting"
+                status_pair  = curses.color_pair(P_WAITING)
+            else:
+                status_label = "idle"
+                status_pair  = curses.color_pair(P_IDLE)
+
+            detail = notif_msg if (status != "busy" and notif_msg) else tool_summary
+            model = model_cache[sid][0] if sid in model_cache else ""
+            is_selected = (i == selected)
+
+            # whole-row pair when selected
+            row_pair = curses.color_pair(P_SEL) if is_selected else curses.color_pair(P_NORMAL)
+
+            # name/label pair — use session color if set, else normal
+            if label_color and not is_selected:
+                name_pair = color_pair_for(label_color, P_NORMAL)
+            else:
+                name_pair = row_pair
+
+            x = 1
+            try:
+                pid_pair  = row_pair if is_selected else (
+                    color_pair_for(label_color, P_DIM) if label_color else curses.color_pair(P_DIM))
+                stdscr.addstr(row, x, clamp(pid_str,      C_PID),    pid_pair)
+                x += C_PID + 1
+                stdscr.addstr(row, x, clamp(status_label, C_STATUS),
+                              row_pair if is_selected else (status_pair | curses.A_BOLD))
+                x += C_STATUS + 1
+                stdscr.addstr(row, x, clamp(sid[:C_SID], C_SID),
+                              row_pair if is_selected else curses.color_pair(P_DIM))
+                x += C_SID + 1
+                raw_pane  = session_panes.get(sid, "")
+                pane_disp = (window_index_for_pane(raw_pane, pane_win_idx)
+                             or pane_strip(raw_pane)) if raw_pane else ""
+                stdscr.addstr(row, x, clamp(pane_disp, C_PANE),
+                              row_pair if is_selected else curses.color_pair(P_DIM))
+                x += C_PANE + 1
+                stdscr.addstr(row, x, clamp(label_name, C_NAME), name_pair | curses.A_BOLD)
+                x += C_NAME + 1
+                stdscr.addstr(row, x, clamp(prj, C_PRJ),
+                              row_pair if is_selected else curses.color_pair(P_DIM))
+                x += C_PRJ + 1
+                stdscr.addstr(row, x, clamp(uptime,       C_UP),
+                              row_pair if is_selected else curses.color_pair(P_DIM))
+                x += C_UP + 1
+                stdscr.addstr(row, x, clamp(tool_name, C_TOOL),
+                              row_pair if is_selected else curses.color_pair(P_TOOL))
+                x += C_TOOL + 1
+                stdscr.addstr(row, x, clamp(model, C_MODEL),
+                              row_pair if is_selected else curses.color_pair(P_DIM))
+                x += C_MODEL + 1
+                avail = max(0, w - x - 1)
+                stdscr.addstr(row, x, detail[:avail],
+                              row_pair if is_selected else curses.color_pair(P_DIM))
+            except curses.error:
+                pass
+
+            row += 1
+
+        if not all_entries:
+            try:
+                stdscr.addstr(row, 2, "No active Claude sessions found.", curses.color_pair(P_DIM))
+            except curses.error:
+                pass
+            row += 1
+
+        # ── divider ───────────────────────────────────────────────────────
+        row += 1
+        if row < h - 2:
+            try:
+                stdscr.addstr(row, 0, "─" * (w - 1), curses.color_pair(P_DIM))
+            except curses.error:
+                pass
+            row += 1
+
+        # ── events log ────────────────────────────────────────────────────
+        if row < h - 1:
+            label_hdr = " EVENTS" if EVENTS_LOG.exists() else " EVENTS  (run: claude-monitor-setup)"
+            try:
+                stdscr.addstr(row, 0, label_hdr[:w], curses.A_BOLD)
+            except curses.error:
+                pass
+            row += 1
+
+        sid_to_pid = {sid: str(e.get("pid", "?")) for sid, e in registry.items()}
+
+        for ev in events[-(h - row - 1):]:
+            if row >= h - 1:
+                break
+            sid     = ev.get("session_id", "")
+            pid_lbl = sid_to_pid.get(sid, "?")
+            # use label name if available
+            sess_label = labels.get(sid, {}).get("name", "") or pid_lbl
+            ts      = ev.get("ts", "")[:19].replace("T", " ")
+            kind    = ev.get("event", "")
+            payload = ev.get("payload", {})
+            ev_color = labels.get(sid, {}).get("color")
+
+            if kind == "pre-tool-use":
+                tool   = payload.get("tool_name", "")
+                desc   = (payload.get("tool_input", {}).get("description", "")
+                          or str(payload.get("tool_input", {}).get("command", ""))[:55])
+                detail = f"{tool:<10}  {desc}"
+                pair   = color_pair_for(ev_color, P_TOOL)
+            elif kind == "notification":
+                msg    = payload.get("message", payload.get("title", ""))
+                detail = f"notification  {msg}"
+                pair   = color_pair_for(ev_color, P_WAITING)
+            elif kind == "prompt-submit":
+                detail = f"prompt        {payload.get('prompt', '')[:65]}"
+                pair   = color_pair_for(ev_color, P_NORMAL)
+            elif kind in ("stop", "session-start", "session-end"):
+                detail = kind
+                pair   = curses.color_pair(P_DIM)
+            else:
+                detail = f"{kind}  {json.dumps(payload)[:50]}"
+                pair   = curses.color_pair(P_DIM)
+
+            line = f"  {ts}  [{sess_label}]  {detail}"
+            try:
+                stdscr.addstr(row, 0, line[:w - 1], pair)
+            except curses.error:
+                pass
+            row += 1
+
+        stdscr.refresh()
+
+
+def main():
+    try:
+        curses.wrapper(draw)
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    main()

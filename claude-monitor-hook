@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""
+Claude Code hook → ~/.claude/monitor-events.jsonl
+
+Called as:  claude-monitor-hook <event-name>
+Hook payload is read from stdin as JSON.
+Append a compact JSONL line; exit 0 (non-blocking).
+"""
+
+import json
+import subprocess
+import sys
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+LOG          = Path.home() / ".claude" / "monitor-events.jsonl"
+LABELS_FILE  = Path.home() / ".claude" / "monitor-labels.json"
+MAX_LINES    = 5000
+
+
+def tail_trim(path, max_lines):
+    try:
+        lines = path.read_bytes().splitlines(keepends=True)
+        if len(lines) > max_lines + 1000:
+            path.write_bytes(b"".join(lines[-max_lines:]))
+    except Exception:
+        pass
+
+
+def main():
+    event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+
+    record = {
+        "ts": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "event": event,
+        "session_id": payload.get("session_id", ""),
+        "tmux_pane": os.environ.get("TMUX_PANE", ""),
+        "payload": payload,
+    }
+
+    try:
+        with open(LOG, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+    # native macOS notification when Claude is waiting for input
+    if event == "notification":
+        msg = payload.get("message", payload.get("title", "Waiting for your input"))
+        sid = payload.get("session_id", "")
+        # try to get a friendly name from labels
+        try:
+            labels = json.loads(LABELS_FILE.read_text())
+            name = labels.get(sid, {}).get("name", "")
+        except Exception:
+            name = ""
+        title    = f"Claude — {name}" if name else "Claude Code"
+        subtitle = msg
+        script = (
+            f"display notification {json.dumps(subtitle, ensure_ascii=False)}"
+            f" with title {json.dumps(title, ensure_ascii=False)}"
+            f" sound name \"Tink\""
+        )
+        try:
+            subprocess.run(["osascript", "-"], input=script.encode(), timeout=5)
+        except Exception:
+            pass
+
+    # periodic trim (only when file is large)
+    try:
+        if LOG.stat().st_size > 512 * 1024:  # 512 KB
+            tail_trim(LOG, MAX_LINES)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    main()

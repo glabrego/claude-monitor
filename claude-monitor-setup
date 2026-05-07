@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""
+Add claude-monitor hooks to ~/.claude/settings.json without clobbering existing hooks.
+Run once; idempotent — safe to re-run.
+"""
+
+import json
+import sys
+import shutil
+from datetime import datetime
+from pathlib import Path
+
+SETTINGS = Path.home() / ".claude" / "settings.json"
+HOOK_BIN  = Path.home() / ".local" / "bin" / "claude-monitor-hook"
+
+MONITOR_HOOKS = {
+    "PreToolUse": {
+        "command": f"{HOOK_BIN} pre-tool-use",
+        "timeout": 3,
+        "async": True,
+    },
+    "UserPromptSubmit": {
+        "command": f"{HOOK_BIN} prompt-submit",
+        "timeout": 3,
+        "async": True,
+    },
+    "Stop": {
+        "command": f"{HOOK_BIN} stop",
+        "timeout": 3,
+        "async": True,
+    },
+    "SessionStart": {
+        "command": f"{HOOK_BIN} session-start",
+        "timeout": 3,
+        "async": True,
+    },
+    "Notification": {
+        "command": f"{HOOK_BIN} notification",
+        "timeout": 3,
+        "async": True,
+    },
+}
+
+
+def hook_entry(command, timeout, async_=True):
+    return {
+        "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": command,
+            "timeout": timeout,
+            **({"async": True} if async_ else {}),
+        }],
+    }
+
+
+def already_installed(hook_list, marker):
+    return any(
+        h.get("type") == "command" and marker in h.get("command", "")
+        for entry in hook_list
+        for h in entry.get("hooks", [])
+    )
+
+
+def main():
+    if not HOOK_BIN.exists():
+        print(f"ERROR: hook binary not found at {HOOK_BIN}")
+        sys.exit(1)
+
+    # load settings
+    if SETTINGS.exists():
+        with open(SETTINGS) as f:
+            settings = json.load(f)
+    else:
+        settings = {}
+
+    # backup
+    backup = SETTINGS.with_suffix(f".bak.{datetime.now().strftime('%Y%m%d%H%M%S')}")
+    if SETTINGS.exists():
+        shutil.copy2(SETTINGS, backup)
+        print(f"Backed up settings to {backup}")
+
+    hooks_section = settings.setdefault("hooks", {})
+    added = []
+
+    for event, cfg in MONITOR_HOOKS.items():
+        event_hooks = hooks_section.setdefault(event, [])
+        marker = "claude-monitor-hook"
+        if already_installed(event_hooks, marker):
+            print(f"  {event}: already installed, skipping")
+        else:
+            event_hooks.append(hook_entry(cfg["command"], cfg["timeout"], cfg.get("async", True)))
+            added.append(event)
+            print(f"  {event}: added")
+
+    with open(SETTINGS, "w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+
+    if added:
+        print(f"\nInstalled hooks for: {', '.join(added)}")
+        print("Events will be written to ~/.claude/monitor-events.jsonl")
+        print("New sessions will pick up the hooks automatically.")
+    else:
+        print("\nAll hooks already installed — nothing changed.")
+
+
+if __name__ == "__main__":
+    main()
