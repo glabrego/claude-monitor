@@ -12,7 +12,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a full overview of how the 
 
 ## Working with agents
 
-See [docs/AGENTS.md](docs/AGENTS.md) for guidance on how to use AI agents effectively when contributing to this project.
+See [AGENTS.md](AGENTS.md) for guidance on how to use AI agents effectively when contributing to this project.
 
 ## Key files
 
