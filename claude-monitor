@@ -528,6 +528,10 @@ def draw(stdscr):
             if pid not in live_pids:
                 del proc_pane_cache[pid]
 
+        # sort live sessions by tmux pane number ascending; unknown panes last
+        live_entries.sort(key=lambda x: int(p) if (p := pane_strip(session_panes.get(x[0], ""))).isdigit() else 9999)
+        all_entries = live_entries + ended_entries
+
         # sync session names from tmux window names (cached 5s)
         labels_dirty = False
         for sid, entry in live_entries:
