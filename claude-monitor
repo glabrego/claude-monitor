@@ -580,17 +580,15 @@ def draw(stdscr):
                 elif name:
                     labels.setdefault(sid, {})["name"] = name
                     save_labels(labels)
-                    # push name to tmux window so both stay in sync
-                    if True:
-                        pane_id = session_panes.get(sid)
-                        if pane_id:
-                            try:
-                                subprocess.run(
-                                    ["tmux", "rename-window", "-t", pane_id, name],
-                                    timeout=2,
-                                )
-                            except Exception:
-                                pass
+                    pane_id = session_panes.get(sid)
+                    if pane_id:
+                        try:
+                            subprocess.run(
+                                ["tmux", "rename-window", "-t", pane_id, name],
+                                timeout=2,
+                            )
+                        except Exception:
+                            pass
                 else:
                     if sid in labels:
                         labels[sid].pop("name", None)
