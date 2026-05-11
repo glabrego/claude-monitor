@@ -23,6 +23,17 @@ REGISTRY_MAX_DAYS = 7  # prune ended sessions older than this
 PALETTE = [None, "red", "green", "cyan", "magenta", "blue", "yellow"]
 PALETTE_LABELS = ["auto", "red", "green", "cyan", "magenta", "blue", "yellow"]
 
+# ── column widths ─────────────────────────────────────────────────────────────
+C_MODEL  = 12
+C_PID    = 6
+C_STATUS = 8
+C_SID    = 8   # first 8 chars of session UUID
+C_PANE   = 4   # tmux pane id e.g. %12
+C_NAME   = 32
+C_PRJ    = 16
+C_UP     = 8
+C_TOOL   = 12
+
 # ── labels persistence ────────────────────────────────────────────────────────
 
 def load_labels():
@@ -685,16 +696,6 @@ def draw(stdscr):
         sess_state = per_session_state(events)
 
         row = 2
-
-        C_MODEL  = 12
-        C_PID    = 6
-        C_STATUS = 8
-        C_SID    = 8   # first 8 chars of session UUID
-        C_PANE   = 4   # tmux pane id e.g. %12
-        C_NAME   = 32
-        C_PRJ    = 16
-        C_UP     = 8
-        C_TOOL   = 12
 
         # column headers
         x = 1
