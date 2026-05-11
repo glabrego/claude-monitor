@@ -243,7 +243,8 @@ def project_name(cwd):
     return parts[-1] if parts else cwd
 
 def clamp(s, n):
-    return str(s)[:n].ljust(n)
+    s = str(s)
+    return (s[:n - 1] + "…") if len(s) > n else s.ljust(n)
 
 # ── tmux helpers ─────────────────────────────────────────────────────────────
 
