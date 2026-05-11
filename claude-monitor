@@ -671,7 +671,7 @@ def draw(stdscr):
             hint = f"✓ {flash_msg}"
         else:
             flash_msg = ""
-            hint = "↑↓/jk select  n name  c color  x clear  y copy-id  r resume  dd delete  :q quit"
+            hint = "↑↓/jk select  n name  c color  x clear  y copy-id  r/↵ resume  dd delete  :q quit"
         header = f" CLAUDE MONITOR  {ts_str}  {hint}"
         try:
             stdscr.addstr(0, 0, header[:w].ljust(w), curses.color_pair(P_HEADER) | curses.A_BOLD)
