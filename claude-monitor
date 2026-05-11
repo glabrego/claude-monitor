@@ -678,11 +678,6 @@ def draw(stdscr):
         except curses.error:
             pass
 
-        # refresh tmux pane map every 5 s
-        if time.monotonic() - pane_map_ts > 5:
-            pane_map, pane_win_idx = tmux_pane_map()
-            pane_map_ts            = time.monotonic()
-
         # load enough events to fill the whole screen; the render loop below
         # slices to exactly (h - row - 1) lines so it's naturally dynamic:
         # more sessions → higher row → fewer event lines shown, and vice-versa.
