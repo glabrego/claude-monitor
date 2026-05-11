@@ -834,7 +834,7 @@ def draw(stdscr):
             pid_lbl = sid_to_pid.get(sid, "?")
             # use label name if available
             sess_label = labels.get(sid, {}).get("name", "") or pid_lbl
-            ts      = ev.get("ts", "")[:19].replace("T", " ")
+            ts      = ev.get("ts", "")[11:19]
             kind    = ev.get("event", "")
             payload = ev.get("payload", {})
             ev_color = labels.get(sid, {}).get("color")
